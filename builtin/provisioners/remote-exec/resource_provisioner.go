@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform/communicator"
@@ -31,6 +29,11 @@ func (p *ResourceProvisioner) Apply(
 	}
 
 	// Collect the scripts
+	commands, err := p.collectCommands(c)
+	if err != nil {
+		return err
+	}
+
 	scripts, err := p.collectScripts(c)
 	if err != nil {
 		return err
@@ -38,6 +41,15 @@ func (p *ResourceProvisioner) Apply(
 	for _, s := range scripts {
 		defer s.Close()
 	}
+
+	// Copy and execute each command
+	if commands != nil {
+		if err := p.runCommands(o, comm, commands); err != nil {
+			return err
+		}
+	}
+
+	comm, err = communicator.New(s)
 
 	// Copy and execute each script
 	if err := p.runScripts(o, comm, scripts); err != nil {
@@ -65,7 +77,7 @@ func (p *ResourceProvisioner) Validate(c *terraform.ResourceConfig) (ws []string
 
 // generateScript takes the configuration and creates a script to be executed
 // from the inline configs
-func (p *ResourceProvisioner) generateScript(c *terraform.ResourceConfig) (string, error) {
+func (p *ResourceProvisioner) generateScript(c *terraform.ResourceConfig) ([]string, error) {
 	var lines []string
 	command, ok := c.Config["inline"]
 	if ok {
@@ -80,31 +92,33 @@ func (p *ResourceProvisioner) generateScript(c *terraform.ResourceConfig) (strin
 				if ok {
 					lines = append(lines, lStr)
 				} else {
-					return "", fmt.Errorf("Unsupported 'inline' type! Must be string, or list of strings.")
+					return lines, fmt.Errorf("Unsupported 'inline' type! Must be string, or list of strings.")
 				}
 			}
 		default:
-			return "", fmt.Errorf("Unsupported 'inline' type! Must be string, or list of strings.")
+			return lines, fmt.Errorf("Unsupported 'inline' type! Must be string, or list of strings.")
 		}
 	}
 	lines = append(lines, "")
-	return strings.Join(lines, "\n"), nil
+	return lines, nil
+}
+
+func (p *ResourceProvisioner) collectCommands(c *terraform.ResourceConfig) ([]string, error) {
+	// Check if inline
+	_, ok := c.Config["inline"]
+	if ok {
+		commands, err := p.generateScript(c)
+		if err != nil {
+			return nil, err
+		}
+		return commands, nil
+	}
+	return nil, nil
 }
 
 // collectScripts is used to collect all the scripts we need
 // to execute in preparation for copying them.
 func (p *ResourceProvisioner) collectScripts(c *terraform.ResourceConfig) ([]io.ReadCloser, error) {
-	// Check if inline
-	_, ok := c.Config["inline"]
-	if ok {
-		script, err := p.generateScript(c)
-		if err != nil {
-			return nil, err
-		}
-		rc := ioutil.NopCloser(bytes.NewReader([]byte(script)))
-		return []io.ReadCloser{rc}, nil
-	}
-
 	// Collect scripts
 	var scripts []string
 	s, ok := c.Config["script"]
@@ -219,6 +233,60 @@ func (p *ResourceProvisioner) runScripts(
 		if err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// runCommands is used to copy and execute a set of scripts
+func (p *ResourceProvisioner) runCommands(
+	o terraform.UIOutput,
+	comm communicator.Communicator,
+	commands []string) error {
+	// Wait and retry until we establish the connection
+	err := retryFunc(comm.Timeout(), func() error {
+		err := comm.Connect(o)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	defer comm.Disconnect()
+
+	for _, command := range commands {
+		var cmd *remote.Cmd
+		outR, outW := io.Pipe()
+		errR, errW := io.Pipe()
+		outDoneCh := make(chan struct{})
+		errDoneCh := make(chan struct{})
+		go p.copyOutput(o, outR, outDoneCh)
+		go p.copyOutput(o, errR, errDoneCh)
+
+		err = retryFunc(comm.Timeout(), func() error {
+
+			cmd = &remote.Cmd{
+				Command: command,
+				Stdout:  outW,
+				Stderr:  errW,
+			}
+			if err := comm.Start(cmd); err != nil {
+				return fmt.Errorf("Error running command: %v", err)
+			}
+
+			return nil
+		})
+		if err == nil {
+			cmd.Wait()
+			if cmd.ExitStatus != 0 {
+				err = fmt.Errorf("Command exited with non-zero exit status: %d", cmd.ExitStatus)
+			}
+		}
+
+		// Wait for output to clean up
+		outW.Close()
+		errW.Close()
+		<-outDoneCh
+		<-errDoneCh
 	}
 
 	return nil
